@@ -32,7 +32,7 @@ class GraphConvolution(nn.Module):
         if self.bias is not None:
             self.bias.data.uniform_(-stdv, stdv)
 
-    def forward(self, input, row_ptr, col_ind, values, adj_shape, device):
+    def forward(self, input, adj, row_ptr, col_ind, values, adj_shape, device):
         support = torch.mm(input, self.weight)
         # Prepare inputs for spmm function
         dim_0 = adj_shape[0]

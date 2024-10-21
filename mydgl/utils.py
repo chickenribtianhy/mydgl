@@ -10,7 +10,7 @@ def my_load_data():
 
     g = data[0]
     # add self loop
-    #g = dgl.remove_self_loop(g)
+    g = dgl.remove_self_loop(g)
     g = dgl.add_self_loop(g)
     
     col,row=g.edges(order='srcdst')
@@ -41,8 +41,8 @@ def my_load_data():
     # print('train_mask', train_mask.size(), train_mask)
     # print('test_maks', test_mask.size(), test_mask)
 
-    # return adj_csr, features, labels, row_ptr, col_ind, values, train_mask, test_mask
-    return adj_csr, features, labels, train_mask, test_mask
+    return adj_csr, features, labels, row_ptr, col_ind, train_mask, test_mask
+    # return adj_csr, features, labels, train_mask, test_mask
 
 
 def encode_onehot(labels):

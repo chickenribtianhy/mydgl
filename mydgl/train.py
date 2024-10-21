@@ -11,11 +11,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
-import scipy.sparse as sp
-
 from utils import my_load_data, accuracy
 
-from models import GCN
 
 # Training settings
 parser = argparse.ArgumentParser()
@@ -44,78 +41,71 @@ if args.cuda:
     torch.cuda.manual_seed(args.seed)
 
 # Load data
-# adj: adjacency matrix (e.g., torch sparse tensor or numpy array)
-# features: node features (torch.Tensor)
-# labels: node labels (torch.Tensor)
-# train_mask, test_mask: boolean masks for training and testing nodes (torch.Tensor)
+# The data returned by my_load_data():
+# adj: adjacency matrix (probably in sparse format)
+# features: node features
+# labels: node labels
+# row_ptr, col_ind: CSR representation of adj (may not be needed here)
+# train_mask, test_mask: boolean masks for training and testing
 
-adj, features, labels, train_mask, test_mask = my_load_data()
-# adj_csr, features, labels, row_ptr, col_ind, values, train_mask, test_mask
+adj, features, labels, row_ptr, col_ind, train_mask, test_mask = my_load_data()
 print('Features shape:', features.shape)
 print('Labels shape:', labels.shape)
 print('Adjacency shape:', adj.shape)
 print('Train mask shape:', train_mask.shape)
 print('Test mask shape:', test_mask.shape)
 
-# Convert adj to CSR format
-def convert_adj_to_csr(adj):
-    # If adj is a torch sparse tensor
-    if isinstance(adj, torch.sparse.FloatTensor):
-        adj = adj.coalesce()
-        indices = adj.indices().cpu().numpy()
-        values = adj.values().cpu().numpy()
-        shape = adj.shape
-        adj_csr = sp.csr_matrix((values, (indices[0], indices[1])), shape=shape)
-    # If adj is a numpy array or torch dense tensor
-    elif isinstance(adj, np.ndarray) or isinstance(adj, torch.Tensor):
-        if isinstance(adj, torch.Tensor):
-            adj = adj.cpu().numpy()
-        adj_csr = sp.csr_matrix(adj)
-    # If adj is already a scipy sparse matrix
-    elif isinstance(adj, sp.spmatrix):
-        adj_csr = adj.tocsr()
+# Convert adjacency matrix to sparse tensor if it's not already
+if not isinstance(adj, torch.sparse.FloatTensor):
+    # Assuming adj is in scipy sparse format
+    import scipy.sparse as sp
+    if isinstance(adj, sp.spmatrix):
+        adj = adj.tocoo()
+        indices = torch.from_numpy(
+            np.vstack((adj.row, adj.col)).astype(np.int64))
+        values = torch.from_numpy(adj.data.astype(np.float32))
+        shape = torch.Size(adj.shape)
+        adj = torch.sparse.FloatTensor(indices, values, shape)
     else:
-        raise ValueError("Unsupported adjacency matrix format")
-    return adj_csr
+        # If adj is a dense numpy array
+        adj = torch.FloatTensor(adj)
+        # Convert to sparse tensor
+        adj = adj.to_sparse()
 
-adj_csr = convert_adj_to_csr(adj)
+# Normalize adjacency matrix (if needed)
+def normalize_adj(adj):
+    """Row-normalize sparse matrix"""
+    adj = adj.coalesce()
+    indices = adj.indices()
+    values = adj.values()
+    row_sum = torch.sparse.sum(adj, dim=1).to_dense()
+    inv_row_sum = 1.0 / row_sum
+    inv_row_sum[inv_row_sum == float('inf')] = 0.0
+    D_inv = torch.diag(inv_row_sum)
+    adj_normalized = torch.sparse.mm(adj, D_inv)
+    return adj_normalized
 
-# Normalize the adjacency matrix (optional)
-def normalize_adj(adj_csr):
-    """Symmetric normalization of adjacency matrix."""
-    adj_csr = adj_csr + sp.eye(adj_csr.shape[0])  # Add self-loops
-    degree = np.array(adj_csr.sum(axis=1)).flatten()
-    d_inv_sqrt = np.power(degree, -0.5)
-    d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.0
-    d_mat_inv_sqrt = sp.diags(d_inv_sqrt)
-    adj_normalized = adj_csr.dot(d_mat_inv_sqrt).transpose().dot(d_mat_inv_sqrt)
-    return adj_normalized.tocsr()
-
-adj_csr = normalize_adj(adj_csr)
-
-# Extract row_ptr, col_ind, and values from adj_csr
-row_ptr = torch.from_numpy(adj_csr.indptr).long()
-col_ind = torch.from_numpy(adj_csr.indices).long()
-values = torch.from_numpy(adj_csr.data).float()
+adj = normalize_adj(adj)
 
 # Move data to GPU if available
-device = torch.device('cuda' if args.cuda else 'cpu')
-features = features.to(device)
-labels = labels.to(device)
-row_ptr = row_ptr.to(device)
-col_ind = col_ind.to(device)
-values = values.to(device)
-train_mask = train_mask.to(device)
-test_mask = test_mask.to(device)
+if args.cuda:
+    features = features.cuda()
+    labels = labels.cuda()
+    adj = adj.cuda()
+    train_mask = train_mask.cuda()
+    test_mask = test_mask.cuda()
 
-
+# Define the GCN model using your custom GraphConvolution layer
+from models import GCN
 
 # Model and optimizer
 model = GCN(nfeat=features.shape[1],
             nhid=args.hidden,
             nclass=int(labels.max()) + 1,
             dropout=args.dropout)
-model = model.to(device)
+
+if args.cuda:
+    model.cuda()
 
 optimizer = optim.Adam(model.parameters(),
                        lr=args.lr, weight_decay=args.weight_decay)
@@ -125,7 +115,7 @@ def train(epoch):
     t = time.time()
     model.train()
     optimizer.zero_grad()
-    output = model(features, row_ptr, col_ind, values, adj_csr.shape, device)
+    output = model(features, adj)
     loss_train = F.nll_loss(output[train_mask], labels[train_mask])
     acc_train = accuracy(output[train_mask], labels[train_mask])
     loss_train.backward()
@@ -134,7 +124,7 @@ def train(epoch):
     if not args.fastmode:
         # Evaluate on training data
         model.eval()
-        output = model(features, row_ptr, col_ind, values, adj_csr.shape, device)
+        output = model(features, adj)
 
     print('Epoch: {:04d}'.format(epoch+1),
           'loss_train: {:.4f}'.format(loss_train.item()),
@@ -144,7 +134,7 @@ def train(epoch):
 # Testing function
 def test():
     model.eval()
-    output = model(features, row_ptr, col_ind, values, adj_csr.shape, device)
+    output = model(features, adj)
     loss_test = F.nll_loss(output[test_mask], labels[test_mask])
     acc_test = accuracy(output[test_mask], labels[test_mask])
     print("Test set results:",
