@@ -4,13 +4,16 @@ from __future__ import print_function
 import time
 import argparse
 import numpy as np
+import math
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
 from utils import my_load_data, accuracy
-from models import GCN
+
+from layers import GraphConvolution
 
 # Training settings
 parser = argparse.ArgumentParser()
@@ -39,77 +42,125 @@ if args.cuda:
     torch.cuda.manual_seed(args.seed)
 
 # Load data
-# adj, features, labels, idx_train, idx_val, idx_test = load_data()
-# return adj_csr, features, labels, row_ptr, col_ind, train_mask, test_mask
+# The data returned by my_load_data():
+# adj: adjacency matrix (probably in sparse format)
+# features: node features
+# labels: node labels
+# row_ptr, col_ind: CSR representation of adj (may not be needed here)
+# train_mask, test_mask: boolean masks for training and testing
+
 adj, features, labels, row_ptr, col_ind, train_mask, test_mask = my_load_data()
-# print(adj)
-print(features.shape)
-print(labels.shape)
-print(row_ptr.shape)
-print(col_ind.shape)
-print(train_mask.shape)
-print(test_mask.shape)
+# print('Features shape:', features.shape)
+# print('Labels shape:', labels.shape)
+# print('Adjacency shape:', adj.shape)
+# print('Train mask shape:', train_mask.shape)
+# print('Test mask shape:', test_mask.shape)
 
-# # Model and optimizer
-# model = GCN(nfeat=features.shape[1],
-#             nhid=args.hidden,
-#             nclass=labels.max().item() + 1,
-#             dropout=args.dropout)
-# optimizer = optim.Adam(model.parameters(),
-#                        lr=args.lr, weight_decay=args.weight_decay)
+# Convert adjacency matrix to sparse tensor if it's not already
+if not isinstance(adj, torch.sparse.FloatTensor):
+    # Assuming adj is in scipy sparse format
+    import scipy.sparse as sp
+    if isinstance(adj, sp.spmatrix):
+        adj = adj.tocoo()
+        indices = torch.from_numpy(
+            np.vstack((adj.row, adj.col)).astype(np.int64))
+        values = torch.from_numpy(adj.data.astype(np.float32))
+        shape = torch.Size(adj.shape)
+        adj = torch.sparse.FloatTensor(indices, values, shape)
+    else:
+        # If adj is a dense numpy array
+        adj = torch.FloatTensor(adj)
+        # Convert to sparse tensor
+        adj = adj.to_sparse()
 
-# if args.cuda:
-#     model.cuda()
-#     features = features.cuda()
-#     adj = adj.cuda()
-#     labels = labels.cuda()
-#     idx_train = idx_train.cuda()
-#     idx_val = idx_val.cuda()
-#     idx_test = idx_test.cuda()
+# Normalize adjacency matrix (if needed)
+def normalize_adj(adj):
+    """Row-normalize sparse matrix"""
+    adj = adj.coalesce()
+    indices = adj.indices()
+    values = adj.values()
+    row_sum = torch.sparse.sum(adj, dim=1).to_dense()
+    inv_row_sum = 1.0 / row_sum
+    inv_row_sum[inv_row_sum == float('inf')] = 0.0
+    D_inv = torch.diag(inv_row_sum)
+    adj_normalized = torch.sparse.mm(adj, D_inv)
+    return adj_normalized
 
+adj = normalize_adj(adj)
 
-# def train(epoch):
-#     t = time.time()
-#     model.train()
-#     optimizer.zero_grad()
-#     output = model(features, adj)
-#     loss_train = F.nll_loss(output[idx_train], labels[idx_train])
-#     acc_train = accuracy(output[idx_train], labels[idx_train])
-#     loss_train.backward()
-#     optimizer.step()
+# Move data to GPU if available
+if args.cuda:
+    features = features.cuda()
+    labels = labels.cuda()
+    adj = adj.cuda()
+    train_mask = train_mask.cuda()
+    test_mask = test_mask.cuda()
 
-#     if not args.fastmode:
-#         # Evaluate validation set performance separately,
-#         # deactivates dropout during validation run.
-#         model.eval()
-#         output = model(features, adj)
+# Define the GCN model using your custom GraphConvolution layer
+class GCN(nn.Module):
+    def __init__(self, nfeat, nhid, nclass, dropout):
+        super(GCN, self).__init__()
 
-#     loss_val = F.nll_loss(output[idx_val], labels[idx_val])
-#     acc_val = accuracy(output[idx_val], labels[idx_val])
-#     print('Epoch: {:04d}'.format(epoch+1),
-#           'loss_train: {:.4f}'.format(loss_train.item()),
-#           'acc_train: {:.4f}'.format(acc_train.item()),
-#           'loss_val: {:.4f}'.format(loss_val.item()),
-#           'acc_val: {:.4f}'.format(acc_val.item()),
-#           'time: {:.4f}s'.format(time.time() - t))
+        self.gc1 = GraphConvolution(nfeat, nhid)
+        self.gc2 = GraphConvolution(nhid, nclass)
+        self.dropout = dropout
 
+    def forward(self, x, adj):
+        x = F.dropout(x, self.dropout, training=self.training)
+        x = F.relu(self.gc1(x, adj))
+        x = F.dropout(x, self.dropout, training=self.training)
+        x = self.gc2(x, adj)
+        return F.log_softmax(x, dim=1)
 
-# def test():
-#     model.eval()
-#     output = model(features, adj)
-#     loss_test = F.nll_loss(output[idx_test], labels[idx_test])
-#     acc_test = accuracy(output[idx_test], labels[idx_test])
-#     print("Test set results:",
-#           "loss= {:.4f}".format(loss_test.item()),
-#           "accuracy= {:.4f}".format(acc_test.item()))
+# Model and optimizer
+model = GCN(nfeat=features.shape[1],
+            nhid=args.hidden,
+            nclass=int(labels.max()) + 1,
+            dropout=args.dropout)
 
+if args.cuda:
+    model.cuda()
 
-# # Train model
-# t_total = time.time()
-# for epoch in range(args.epochs):
-#     train(epoch)
-# print("Optimization Finished!")
-# print("Total time elapsed: {:.4f}s".format(time.time() - t_total))
+optimizer = optim.Adam(model.parameters(),
+                       lr=args.lr, weight_decay=args.weight_decay)
 
-# # Testing
-# test()
+# Training function
+def train(epoch):
+    t = time.time()
+    model.train()
+    optimizer.zero_grad()
+    output = model(features, adj)
+    loss_train = F.nll_loss(output[train_mask], labels[train_mask])
+    acc_train = accuracy(output[train_mask], labels[train_mask])
+    loss_train.backward()
+    optimizer.step()
+
+    if not args.fastmode:
+        # Evaluate on training data
+        model.eval()
+        output = model(features, adj)
+
+    print('Epoch: {:04d}'.format(epoch+1),
+          'loss_train: {:.4f}'.format(loss_train.item()),
+          'acc_train: {:.4f}'.format(acc_train.item()),
+          'time: {:.4f}s'.format(time.time() - t))
+
+# Testing function
+def test():
+    model.eval()
+    output = model(features, adj)
+    loss_test = F.nll_loss(output[test_mask], labels[test_mask])
+    acc_test = accuracy(output[test_mask], labels[test_mask])
+    print("Test set results:",
+          "loss= {:.4f}".format(loss_test.item()),
+          "accuracy= {:.4f}".format(acc_test.item()))
+
+# Train model
+t_total = time.time()
+for epoch in range(args.epochs):
+    train(epoch)
+print("Optimization Finished!")
+print("Total time elapsed: {:.4f}s".format(time.time() - t_total))
+
+# Testing
+test()
