@@ -11,7 +11,7 @@ def my_load_data():
     g = data[0]
     # add self loop
     #g = dgl.remove_self_loop(g)
-    #g = dgl.add_self_loop(g)
+    g = dgl.add_self_loop(g)
     
     col,row=g.edges(order='srcdst')
 
@@ -21,9 +21,9 @@ def my_load_data():
 
     adj_csr = sp.csr_matrix((numlist.numpy(), (row, col)), shape=(g.num_nodes(), g.num_nodes()))
 
-    row_ptr=torch.from_numpy(adj_csr.indptr)
-    col_ind=torch.from_numpy(adj_csr.indices)
-
+    row_ptr = torch.from_numpy(adj_csr.indptr)
+    col_ind = torch.from_numpy(adj_csr.indices)
+    values = torch.from_numpy(adj_csr.data)
 
 
     features=g.ndata['feat']
@@ -36,11 +36,13 @@ def my_load_data():
     # print('row count', row_ptr.size())
     # print('col index', col_ind.size())
     # print('features', features.size())
+    # print(features)
     # print('labels',  labels.size())
     # print('train_mask', train_mask.size(), train_mask)
     # print('test_maks', test_mask.size(), test_mask)
 
-    return adj_csr, features, labels, row_ptr, col_ind, train_mask, test_mask
+    # return adj_csr, features, labels, row_ptr, col_ind, values, train_mask, test_mask
+    return adj_csr, features, labels, train_mask, test_mask
 
 
 def encode_onehot(labels):
